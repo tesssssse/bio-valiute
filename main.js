@@ -11,11 +11,8 @@
  * - Enforces single vault per device, with persistent IndexedDB storage
  * - RESTORES the last visited page on reload (session resume)
  *
- * NEW ADDITIONS:
- *  1) Enhanced requestPersistentStorage() to reduce data eviction.
- *  2) "beforeinstallprompt" event handler to prompt Add to Home Screen 
- *     on supported mobile browsers. This helps keep the PWA installed 
- *     and reduces the chance of losing data even if the browser is closed.
+ * NEW: We embed the **sender**'s Bio‑IBAN in the Bio‑Catch string 
+ * to guarantee it is restricted between the true sender & receiver.
  ***********************************************************************/
 
 // =========================
@@ -114,8 +111,6 @@ function requestPersistentStorage() {
         console.warn("⚠️ Storage might still be cleared under extreme conditions.");
       }
     });
-  } else {
-    console.warn("⚠️ StorageManager API not fully supported. IndexedDB data might still be evicted on some browsers.");
   }
 }
 
@@ -343,6 +338,7 @@ async function clearVaultDB() {
 async function createNewVault(pin) {
   const stored = await loadVaultDataFromDB();
   if (stored) {
+    // Enforce single vault
     alert('❌ A vault already exists on this device. Please unlock it instead with your old PIN.');
     return;
   }
@@ -759,36 +755,6 @@ function initializeUI() {
     });
   }
 
-  // =============== NEW: "Add To Home Screen" Logic ===============
-  // Some browsers (Chrome on Android, etc.) will fire 'beforeinstallprompt'
-  // so we can show a custom button to prompt the user to add the PWA to home screen.
-  window.addEventListener('beforeinstallprompt', (e) => {
-    // Prevent default prompt so we can show our own UI
-    e.preventDefault();
-
-    // Example: Create a small "Install" button dynamically or show an alert
-    const installBtn = document.createElement('button');
-    installBtn.textContent = '📱 Install BioVault';
-    installBtn.style.cssText = 'position:fixed;bottom:20px;left:20px;z-index:9999;padding:10px;background:#2ecc71;color:#fff;border:none;border-radius:5px;';
-
-    installBtn.addEventListener('click', () => {
-      // Show the prompt
-      e.prompt();
-      // Optionally check the outcome
-      e.userChoice.then((choiceResult) => {
-        if (choiceResult.outcome === 'accepted') {
-          console.log('✅ User accepted A2HS prompt.');
-          document.body.removeChild(installBtn);
-        } else {
-          console.log('❌ User dismissed A2HS prompt.');
-        }
-      });
-    });
-
-    document.body.appendChild(installBtn);
-  });
-  // =============================================================
-
   window.addEventListener('click', (event) => {
     if (event.target === bioCatchPopup) {
       bioCatchPopup.style.display = 'none';
@@ -804,25 +770,38 @@ function initializeUI() {
 
 let transactionLock = false;
 
+/**
+ * Generate a Bio-Catch code that includes the sender IBAN as a 4th segment.
+ */
 function generateBioCatchNumber(senderBioIBAN, receiverBioIBAN, amount, timestamp) {
   const senderNumeric = parseInt(senderBioIBAN.slice(3));
   const receiverNumeric = parseInt(receiverBioIBAN.slice(3));
-  const firstPart = senderNumeric + receiverNumeric;
-  const secondPart = amount + timestamp;
-  // This returns "Bio-<sum>-<sum2>", or you can do the 4-part version if you like.
-  return `Bio-${firstPart}-${secondPart}`;
+  const firstPart = senderNumeric + receiverNumeric; // existing logic
+  const secondPart = amount + timestamp;            // existing logic
+  // NEW: add the **actual sender’s IBAN** as a final part:
+  return `Bio-${firstPart}-${secondPart}-${senderBioIBAN}`;
 }
 
+/**
+ * Validate that the Bio-Catch code:
+ *  - Has 4 parts (Bio, <sum>, <sum2>, <senderIBAN>)
+ *  - The <sum> matches the sender+receiver numeric
+ *  - The <senderIBAN> matches the actual derived IBAN from the sum
+ *  - The time difference is within 12 minutes, etc.
+ */
 function validateBioCatchNumber(bioCatchNumber, amount) {
   const parts = bioCatchNumber.split('-');
-  if (parts.length !== 3 || parts[0] !== 'Bio') {
-    return { valid: false, message: 'Format must be Bio-<first>-<second>.' };
+  if (parts.length !== 4 || parts[0] !== 'Bio') {
+    return { valid: false, message: 'Format must be Bio-<first>-<second>-<senderIBAN>.' };
   }
   const firstPart = parseInt(parts[1]);
   const secondPart = parseInt(parts[2]);
+  const claimedSenderIBAN = parts[3];
+
   if (isNaN(firstPart) || isNaN(secondPart)) {
-    return { valid: false, message: 'Both parts must be numeric.' };
+    return { valid: false, message: 'Both numeric parts must be valid numbers.' };
   }
+
   const receiverNumeric = parseInt(vaultData.bioIBAN.slice(3));
   const senderNumeric = firstPart - receiverNumeric;
   const expectedFirstPart = senderNumeric + receiverNumeric;
@@ -836,6 +815,13 @@ function validateBioCatchNumber(bioCatchNumber, amount) {
   if (timeDiff > TRANSACTION_VALIDITY_SECONDS) {
     return { valid: false, message: 'Timestamp is outside ±12min window.' };
   }
+
+  // Ensure the 4th part matches the actual derived sender IBAN
+  const expectedSenderIBAN = `BIO${senderNumeric}`;
+  if (claimedSenderIBAN !== expectedSenderIBAN) {
+    return { valid: false, message: 'Mismatched Sender IBAN in the Bio-Catch code.' };
+  }
+
   return { valid: true };
 }
 
@@ -884,6 +870,7 @@ async function handleSendTransaction() {
   transactionLock = true;
   try {
     const currentTimestamp = vaultData.lastUTCTimestamp;
+    // Now includes the full sender IBAN in the code
     const plainBioCatchNumber = generateBioCatchNumber(
       vaultData.bioIBAN,
       receiverBioIBAN,
@@ -974,10 +961,45 @@ async function handleReceiveTransaction() {
       }
     }
 
+    // Now includes the 4th part => the actual sender IBAN
     const validation = validateBioCatchNumber(bioCatchNumber, amount);
     if (!validation.valid) {
       alert(`❌ BioCatch Validation Failed: ${validation.message}`);
       return;
+    }
+
+    // After validation, we can parse the parts again to 
+    // figure out the extracted timestamp, etc.
+    const parts = bioCatchNumber.split('-');
+    const firstPart = parseInt(parts[1]);
+    const secondPart = parseInt(parts[2]);
+    const claimedSenderIBAN = parts[3];
+
+    const receiverNumeric = parseInt(vaultData.bioIBAN.slice(3));
+    const senderNumeric = firstPart - receiverNumeric;
+    const senderBioIBAN = `BIO${senderNumeric}`;
+    const extractedTimestamp = secondPart - amount;
+
+    if (!validateBioIBAN(senderBioIBAN)) {
+      alert('❌ Invalid Sender Bio‑IBAN extracted from BioCatch Number.');
+      return;
+    }
+
+    const currentTimestamp = vaultData.lastUTCTimestamp;
+    const timeDifference = Math.abs(currentTimestamp - extractedTimestamp);
+    if (timeDifference > TRANSACTION_VALIDITY_SECONDS) {
+      alert('❌ The timestamp in BioCatch Number is outside acceptable window.');
+      return;
+    }
+
+    for (let tx of vaultData.transactions) {
+      if (tx.bioCatch) {
+        const existingPlain = await decryptBioCatchNumber(tx.bioCatch);
+        if (existingPlain === bioCatchNumber) {
+          alert('❌ This BioCatch Number has already been used in a transaction.');
+          return;
+        }
+      }
     }
 
     vaultData.balanceTVM += amount;
@@ -986,10 +1008,10 @@ async function handleReceiveTransaction() {
     const obfuscatedCatch = await encryptBioCatchNumber(bioCatchNumber);
     vaultData.transactions.push({
       type: 'received',
-      senderBioIBAN: vaultData.bioIBAN, // optional
+      senderBioIBAN,
       bioCatch: obfuscatedCatch,
       amount,
-      timestamp: vaultData.lastUTCTimestamp,
+      timestamp: currentTimestamp,
       status: 'Valid'
     });
 
